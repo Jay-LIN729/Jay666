@@ -105,6 +105,8 @@ typedef struct  tju_tcp{
     uint32_t snd_nxt;   // 下一个准备发送的序号
     uint32_t rcv_nxt;   // 下一个期望接收的序号
 
+    int syn_retransmitted;  // 建连阶段SYN是否发生过重传
+    
     // 连接状态变化的同步
     pthread_mutex_t state_lock;
     pthread_cond_t state_cond;

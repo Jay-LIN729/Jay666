@@ -1,5 +1,6 @@
 #include "tju_tcp.h"
 #include <time.h>
+#include <errno.h>
 
 static pthread_mutex_t isn_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t isn_counter = 0;
@@ -17,6 +18,47 @@ static uint32_t generate_isn(){
            (cnt * 2654435761u);
 }
 
+static void* synack_retransmit_thread(void* arg){
+    tju_tcp_t* sock = (tju_tcp_t*)arg;
+
+    while(1){
+        struct timespec wait_time;
+        wait_time.tv_sec = 1;
+        wait_time.tv_nsec = 0;
+
+        nanosleep(&wait_time, NULL);
+
+        pthread_mutex_lock(&(sock->state_lock));
+
+        // 已经收到第三次ACK，或者状态发生变化，则停止重传
+        if(sock->state != SYN_RECV){
+            pthread_mutex_unlock(&(sock->state_lock));
+            break;
+        }
+
+        // 仍处于SYN_RECV，重传原来的SYN+ACK
+        char* retry_syn_ack = create_packet_buf(
+            sock->established_local_addr.port,
+            sock->established_remote_addr.port,
+            sock->iss,
+            sock->rcv_nxt,
+            DEFAULT_HEADER_LEN,
+            DEFAULT_HEADER_LEN,
+            SYN_FLAG_MASK | ACK_FLAG_MASK,
+            65535,
+            0,
+            NULL,
+            0
+        );
+
+        sendToLayer3(retry_syn_ack, DEFAULT_HEADER_LEN);
+        free(retry_syn_ack);
+
+        pthread_mutex_unlock(&(sock->state_lock));
+    }
+
+    return NULL;
+}
 /*
 创建 TCP socket 
 初始化对应的结构体
@@ -32,6 +74,8 @@ tju_tcp_t* tju_socket(){
     sock->snd_una = 0;
     sock->snd_nxt = 0;
     sock->rcv_nxt = 0;
+
+    sock->syn_retransmitted = 0;
 
     // connection state synchronization
     pthread_mutex_init(&(sock->state_lock), NULL);
@@ -171,15 +215,51 @@ free(syn_pkt);
 pthread_mutex_lock(&(sock->state_lock));
 
 while(sock->state != ESTABLISHED){
-    pthread_cond_wait(&(sock->state_cond),
-                      &(sock->state_lock));
+
+    // 当前建连阶段的RTO先设为1秒
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 1;
+
+    int wait_rst = pthread_cond_timedwait(
+        &(sock->state_cond),
+        &(sock->state_lock),
+        &timeout
+    );
+
+    // 可能恰好在超时时刻收到了SYN+ACK
+    if(sock->state == ESTABLISHED){
+        break;
+    }
+
+    // 超时仍未建立连接，重传同一个SYN
+    if(wait_rst == ETIMEDOUT){
+
+        sock->syn_retransmitted = 1;
+
+        char* retry_syn = create_packet_buf(
+            sock->established_local_addr.port,
+            sock->established_remote_addr.port,
+            sock->iss,
+            0,
+            DEFAULT_HEADER_LEN,
+            DEFAULT_HEADER_LEN,
+            SYN_FLAG_MASK,
+            65535,
+            0,
+            NULL,
+            0
+        );
+
+        sendToLayer3(retry_syn, DEFAULT_HEADER_LEN);
+        free(retry_syn);
+    }
 }
 
 pthread_mutex_unlock(&(sock->state_lock));
 
 return 0;
 }
-
 int tju_send(tju_tcp_t* sock, const void *buffer, int len){
     // 这里当然不能直接简单地调用sendToLayer3
     char* data = malloc(len);
@@ -276,6 +356,69 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         pthread_mutex_unlock(&(sock->state_lock));
 
         return 0;
+    }
+
+        // 客户端已ESTABLISHED后再次收到握手阶段的SYN+ACK
+    // 说明第三次ACK可能丢失，需要重新回复ACK
+    if(sock->state == ESTABLISHED &&
+       (flags & SYN_FLAG_MASK) &&
+       (flags & ACK_FLAG_MASK)){
+
+        // 必须确认是本次连接之前的那个SYN+ACK
+        if(get_seq(pkt) != sock->irs ||
+           get_ack(pkt) != sock->snd_nxt){
+            return 0;
+        }
+
+        char* retry_ack = create_packet_buf(
+            sock->established_local_addr.port,
+            sock->established_remote_addr.port,
+            sock->snd_nxt,
+            sock->rcv_nxt,
+            DEFAULT_HEADER_LEN,
+            DEFAULT_HEADER_LEN,
+            ACK_FLAG_MASK,
+            65535,
+            0,
+            NULL,
+            0
+        );
+
+        sendToLayer3(retry_ack, DEFAULT_HEADER_LEN);
+        free(retry_ack);
+
+        return 0;
+    }
+
+        // SYN_RECV状态下再次收到同一个SYN：
+    // 说明客户端可能没有收到之前的SYN+ACK，重新发送SYN+ACK
+    if(sock->state == SYN_RECV &&
+       (flags & SYN_FLAG_MASK) &&
+       !(flags & ACK_FLAG_MASK)){
+
+        // 只接受本次连接原SYN的重传
+        if(get_seq(pkt) != sock->irs){
+            return 0;
+        }
+
+        char* retry_syn_ack = create_packet_buf(
+            sock->established_local_addr.port,
+            sock->established_remote_addr.port,
+            sock->iss,
+            sock->rcv_nxt,
+            DEFAULT_HEADER_LEN,
+            DEFAULT_HEADER_LEN,
+            SYN_FLAG_MASK | ACK_FLAG_MASK,
+            65535,
+            0,
+            NULL,
+            0
+        );
+
+        sendToLayer3(retry_syn_ack, DEFAULT_HEADER_LEN);
+        free(retry_syn_ack);
+
+return 0;
     }
 
         // 服务器收到第三次握手ACK
@@ -382,9 +525,22 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         );
 
         sendToLayer3(syn_ack_pkt, DEFAULT_HEADER_LEN);
-        free(syn_ack_pkt);
+free(syn_ack_pkt);
 
-        return 0;
+// 启动SYN+ACK超时重传线程
+pthread_t synack_thread;
+if(pthread_create(&synack_thread,
+                  NULL,
+                  synack_retransmit_thread,
+                  (void*)new_conn) != 0){
+    perror("ERROR create SYN+ACK retransmit thread");
+    exit(-1);
+}
+
+// 后台线程自行结束，不需要join
+pthread_detach(synack_thread);
+
+return 0;
     }
 
     uint32_t data_len = get_plen(pkt) - DEFAULT_HEADER_LEN;
