@@ -1,4 +1,21 @@
 #include "tju_tcp.h"
+#include <time.h>
+
+static pthread_mutex_t isn_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t isn_counter = 0;
+
+static uint32_t generate_isn(){
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    pthread_mutex_lock(&isn_lock);
+    uint32_t cnt = ++isn_counter;
+    pthread_mutex_unlock(&isn_lock);
+
+    return (uint32_t)ts.tv_sec ^
+           (uint32_t)ts.tv_nsec ^
+           (cnt * 2654435761u);
+}
 
 /*
 创建 TCP socket 
@@ -8,7 +25,27 @@
 tju_tcp_t* tju_socket(){
     tju_tcp_t* sock = (tju_tcp_t*)malloc(sizeof(tju_tcp_t));
     sock->state = CLOSED;
-    
+
+    // handshake sequence state
+    sock->iss = 0;
+    sock->irs = 0;
+    sock->snd_una = 0;
+    sock->snd_nxt = 0;
+    sock->rcv_nxt = 0;
+
+    // connection state synchronization
+    pthread_mutex_init(&(sock->state_lock), NULL);
+
+    if(pthread_cond_init(&(sock->state_cond), NULL) != 0){
+        perror("ERROR state condition variable not set\n");
+        exit(-1);
+    }
+   
+        sock->parent_listen = NULL;
+    sock->accept_head = NULL;
+    sock->accept_tail = NULL;
+    sock->accept_next = NULL;
+
     pthread_mutex_init(&(sock->send_lock), NULL);
     sock->sending_buf = NULL;
     sock->sending_len = 0;
@@ -22,7 +59,7 @@ tju_tcp_t* tju_socket(){
         exit(-1);
     }
 
-    sock->window.wnd_recv = NULL;
+    sock->window.wnd_send = NULL;
     sock->window.wnd_recv = NULL;
 
     return sock;
@@ -55,36 +92,27 @@ int tju_listen(tju_tcp_t* sock){
 因为只要该函数返回, 用户就可以马上使用该socket进行send和recv
 */
 tju_tcp_t* tju_accept(tju_tcp_t* listen_sock){
-    tju_tcp_t* new_conn = (tju_tcp_t*)malloc(sizeof(tju_tcp_t));
-    memcpy(new_conn, listen_sock, sizeof(tju_tcp_t));
 
-    tju_sock_addr local_addr, remote_addr;
-    /*
-     这里涉及到TCP连接的建立
-     正常来说应该是收到客户端发来的SYN报文
-     从中拿到对端的IP和PORT
-     换句话说 下面的处理流程其实不应该放在这里 应该在tju_handle_packet中
-    */ 
-    remote_addr.ip = inet_network(CLIENT_IP);  //具体的IP地址
-    remote_addr.port = 5678;  //端口
+    pthread_mutex_lock(&(listen_sock->state_lock));
 
-    local_addr.ip = listen_sock->bind_addr.ip;  //具体的IP地址
-    local_addr.port = listen_sock->bind_addr.port;  //端口
+    // 已完成连接队列为空时，accept阻塞等待
+    while(listen_sock->accept_head == NULL){
+        pthread_cond_wait(&(listen_sock->state_cond),
+                          &(listen_sock->state_lock));
+    }
 
-    new_conn->established_local_addr = local_addr;
-    new_conn->established_remote_addr = remote_addr;
+    // 从已完成连接队列头部取出一个连接
+    tju_tcp_t* new_conn = listen_sock->accept_head;
+    listen_sock->accept_head = new_conn->accept_next;
 
-    // 这里应该是经过三次握手后才能修改状态为ESTABLISHED
-    new_conn->state = ESTABLISHED;
+    if(listen_sock->accept_head == NULL){
+        listen_sock->accept_tail = NULL;
+    }
 
-    // 将新的conn放到内核建立连接的socket哈希表中
-    int hashval = cal_hash(local_addr.ip, local_addr.port, remote_addr.ip, remote_addr.port);
-    established_socks[hashval] = new_conn;
+    new_conn->accept_next = NULL;
 
-    // 如果new_conn的创建过程放到了tju_handle_packet中 那么accept怎么拿到这个new_conn呢
-    // 在linux中 每个listen socket都维护一个已经完成连接的socket队列
-    // 每次调用accept 实际上就是取出这个队列中的一个元素
-    // 队列为空,则阻塞 
+    pthread_mutex_unlock(&(listen_sock->state_lock));
+
     return new_conn;
 }
 
@@ -105,17 +133,51 @@ int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
     local_addr.port = 5678; // 连接方进行connect连接的时候 内核中是随机分配一个可用的端口
     sock->established_local_addr = local_addr;
 
-    // 这里也不能直接建立连接 需要经过三次握手
-    // 实际在linux中 connect调用后 会进入一个while循环
-    // 循环跳出的条件是socket的状态变为ESTABLISHED 表面看上去就是 正在连接中 阻塞
-    // 而状态的改变在别的地方进行 在我们这就是tju_handle_packet
-    sock->state = ESTABLISHED;
+    // 生成本次连接的初始发送序号
+sock->iss = generate_isn();
+sock->snd_una = sock->iss;
 
-    // 将建立了连接的socket放入内核 已建立连接哈希表中
-    int hashval = cal_hash(local_addr.ip, local_addr.port, target_addr.ip, target_addr.port);
-    established_socks[hashval] = sock;
+// SYN会占用一个序号
+sock->snd_nxt = sock->iss + 1;
 
-    return 0;
+// 客户端进入SYN_SENT状态
+sock->state = SYN_SENT;
+
+// 必须先放入已建立连接哈希表
+// 这样后续收到SYN+ACK时才能找到这个socket
+int hashval = cal_hash(local_addr.ip, local_addr.port,
+                       target_addr.ip, target_addr.port);
+established_socks[hashval] = sock;
+
+// 构造并发送第一次握手的SYN报文
+char* syn_pkt = create_packet_buf(
+    sock->established_local_addr.port,
+    sock->established_remote_addr.port,
+    sock->iss,
+    0,
+    DEFAULT_HEADER_LEN,
+    DEFAULT_HEADER_LEN,
+    SYN_FLAG_MASK,
+    65535,
+    0,
+    NULL,
+    0
+);
+
+sendToLayer3(syn_pkt, DEFAULT_HEADER_LEN);
+free(syn_pkt);
+
+// connect必须等到三次握手真正完成后才能返回
+pthread_mutex_lock(&(sock->state_lock));
+
+while(sock->state != ESTABLISHED){
+    pthread_cond_wait(&(sock->state_cond),
+                      &(sock->state_lock));
+}
+
+pthread_mutex_unlock(&(sock->state_lock));
+
+return 0;
 }
 
 int tju_send(tju_tcp_t* sock, const void *buffer, int len){
@@ -167,7 +229,164 @@ int tju_recv(tju_tcp_t* sock, void *buffer, int len){
 }
 
 int tju_handle_packet(tju_tcp_t* sock, char* pkt){
-    
+
+        uint8_t flags = get_flags(pkt);
+
+	    // 客户端收到第二次握手 SYN+ACK
+    if(sock->state == SYN_SENT &&
+       (flags & SYN_FLAG_MASK) &&
+       (flags & ACK_FLAG_MASK)){
+
+        uint32_t ack_num = get_ack(pkt);
+
+        // SYN占用一个序号，因此对端应确认 iss + 1
+        if(ack_num != sock->snd_nxt){
+            return 0;
+        }
+
+        // 记录服务器ISN
+        sock->irs = get_seq(pkt);
+        sock->rcv_nxt = sock->irs + 1;
+
+        // 客户端SYN已被确认
+        sock->snd_una = ack_num;
+
+        // 构造第三次握手 ACK
+        char* ack_pkt = create_packet_buf(
+            sock->established_local_addr.port,
+            sock->established_remote_addr.port,
+            sock->snd_nxt,
+            sock->rcv_nxt,
+            DEFAULT_HEADER_LEN,
+            DEFAULT_HEADER_LEN,
+            ACK_FLAG_MASK,
+            65535,
+            0,
+            NULL,
+            0
+        );
+
+        sendToLayer3(ack_pkt, DEFAULT_HEADER_LEN);
+        free(ack_pkt);
+
+        // 三次握手在客户端完成
+        pthread_mutex_lock(&(sock->state_lock));
+        sock->state = ESTABLISHED;
+        pthread_cond_signal(&(sock->state_cond));
+        pthread_mutex_unlock(&(sock->state_lock));
+
+        return 0;
+    }
+
+        // 服务器收到第三次握手ACK
+    if(sock->state == SYN_RECV &&
+       (flags & ACK_FLAG_MASK) &&
+       !(flags & SYN_FLAG_MASK)){
+
+        uint32_t ack_num = get_ack(pkt);
+        uint32_t seq_num = get_seq(pkt);
+
+        // 必须确认服务器SYN，同时客户端序号也应正确
+        if(ack_num != sock->snd_nxt ||
+           seq_num != sock->rcv_nxt){
+            return 0;
+        }
+
+        // 服务器SYN已被确认
+        sock->snd_una = ack_num;
+
+        // 连接正式建立
+        pthread_mutex_lock(&(sock->state_lock));
+        sock->state = ESTABLISHED;
+        pthread_cond_signal(&(sock->state_cond));
+        pthread_mutex_unlock(&(sock->state_lock));
+
+        // 将完成握手的子连接放入监听socket的accept队列
+        tju_tcp_t* listen_sock = sock->parent_listen;
+
+        if(listen_sock != NULL){
+            pthread_mutex_lock(&(listen_sock->state_lock));
+
+            sock->accept_next = NULL;
+
+            if(listen_sock->accept_tail == NULL){
+                listen_sock->accept_head = sock;
+                listen_sock->accept_tail = sock;
+            }else{
+                listen_sock->accept_tail->accept_next = sock;
+                listen_sock->accept_tail = sock;
+            }
+
+            // 唤醒正在tju_accept中等待的线程
+            pthread_cond_signal(&(listen_sock->state_cond));
+
+            pthread_mutex_unlock(&(listen_sock->state_lock));
+        }
+
+        return 0;
+    }
+
+    // 监听socket收到第一次握手SYN
+    if(sock->state == LISTEN &&
+       (flags & SYN_FLAG_MASK) &&
+       !(flags & ACK_FLAG_MASK)){
+
+        // 为该连接创建一个新的socket
+        tju_tcp_t* new_conn = tju_socket();
+
+        // 设置连接双方地址
+        new_conn->established_local_addr = sock->bind_addr;
+
+        new_conn->established_remote_addr.ip = inet_network(CLIENT_IP);
+        new_conn->established_remote_addr.port = get_src(pkt);
+
+        // 记录客户端ISN
+        new_conn->irs = get_seq(pkt);
+        new_conn->rcv_nxt = new_conn->irs + 1;
+
+        // 生成服务器ISN，SYN占用一个序号
+        new_conn->iss = generate_isn();
+        new_conn->snd_una = new_conn->iss;
+        new_conn->snd_nxt = new_conn->iss + 1;
+
+        // 记录该子连接属于哪个监听socket
+        new_conn->parent_listen = sock;
+
+        // 进入SYN_RECV状态
+        new_conn->state = SYN_RECV;
+
+        // 先放入established_socks
+        // 这样客户端第三次ACK到达后能够找到new_conn
+        int hashval = cal_hash(
+            new_conn->established_local_addr.ip,
+            new_conn->established_local_addr.port,
+            new_conn->established_remote_addr.ip,
+            new_conn->established_remote_addr.port
+        );
+
+        established_socks[hashval] = new_conn;
+
+        // 构造第二次握手 SYN + ACK
+        char* syn_ack_pkt = create_packet_buf(
+            new_conn->established_local_addr.port,
+            new_conn->established_remote_addr.port,
+            new_conn->iss,
+            new_conn->rcv_nxt,
+            DEFAULT_HEADER_LEN,
+            DEFAULT_HEADER_LEN,
+            SYN_FLAG_MASK | ACK_FLAG_MASK,
+            65535,
+            0,
+            NULL,
+            0
+        );
+
+        sendToLayer3(syn_ack_pkt, DEFAULT_HEADER_LEN);
+        free(syn_ack_pkt);
+
+        return 0;
+    }
+
     uint32_t data_len = get_plen(pkt) - DEFAULT_HEADER_LEN;
 
     // 把收到的数据放到接受缓冲区

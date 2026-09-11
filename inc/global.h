@@ -95,9 +95,26 @@ typedef struct {
 
 
 // TJU_TCP 结构体 保存TJU_TCP用到的各种数据
-typedef struct {
+typedef struct  tju_tcp{
 	int state; // TCP的状态
 
+	    // 连接建立需要的序号状态
+    uint32_t iss;       // 本端初始发送序号 ISN
+    uint32_t irs;       // 对端初始发送序号 ISN
+    uint32_t snd_una;   // 最早尚未确认的发送序号
+    uint32_t snd_nxt;   // 下一个准备发送的序号
+    uint32_t rcv_nxt;   // 下一个期望接收的序号
+
+    // 连接状态变化的同步
+    pthread_mutex_t state_lock;
+    pthread_cond_t state_cond;
+
+        // accept完成连接队列
+    struct tju_tcp* parent_listen;  // 子连接对应的监听socket
+    struct tju_tcp* accept_head;    // 已完成连接队列头
+    struct tju_tcp* accept_tail;    // 已完成连接队列尾
+    struct tju_tcp* accept_next;    // 子连接在队列中的next指针
+    
 	tju_sock_addr bind_addr; // 存放bind和listen时该socket绑定的IP和端口
 	tju_sock_addr established_local_addr; // 存放建立连接后 本机的 IP和端口
 	tju_sock_addr established_remote_addr; // 存放建立连接后 连接对方的 IP和端口
@@ -117,3 +134,4 @@ typedef struct {
 } tju_tcp_t;
 
 #endif
+
