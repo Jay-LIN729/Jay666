@@ -45,6 +45,26 @@
 #define LAST_ACK 9
 #define TIME_WAIT 10
 
+// RFC 6298 handshake timer defaults. The retry limit is kept in one place so
+// it can be adjusted to the value published by the course platform.
+#define TJU_INITIAL_RTO_MS 1000
+#define TJU_MAX_RTO_MS 60000
+#define TJU_SYN_RETRY_LIMIT 3
+#define TJU_RTO_AFTER_SYN_RETRANSMIT_MS 3000
+#define TJU_FIN_RETRY_LIMIT 3
+#define TJU_FIN_INITIAL_RTO_MS 8000
+#define TJU_MSL_MS 1000
+#define TJU_CLOSE_TIMEOUT_MS 20000
+
+// Reliable transport buffers and timer parameters.
+#define TJU_SEND_BUFFER_CAPACITY (5000 * MAX_DLEN)
+#define TJU_RECV_BUFFER_CAPACITY (5000 * MAX_DLEN)
+#define TJU_REORDER_BUFFER_CAPACITY 65535
+#define TJU_MAX_ADVERTISED_WINDOW 65535
+#define TJU_DATA_DRAIN_TIMEOUT_MS 120000
+#define TJU_CLOCK_GRANULARITY_MS 1
+#define TJU_MIN_LOSS_PROBE_MS 10
+
 // TCP 拥塞控制状态
 #define SLOW_START 0
 #define CONGESTION_AVOIDANCE 1
@@ -88,6 +108,14 @@ typedef struct {
   	receiver_window_t* wnd_recv;
 } window_t;
 
+typedef struct sent_segment {
+    uint32_t seq;
+    uint16_t len;
+    uint64_t sent_at_us;
+    int retransmitted;
+    struct sent_segment* next;
+} sent_segment_t;
+
 typedef struct {
 	uint32_t ip;
 	uint16_t port;
@@ -106,6 +134,18 @@ typedef struct  tju_tcp{
     uint32_t rcv_nxt;   // 下一个期望接收的序号
 
     int syn_retransmitted;  // 建连阶段SYN是否发生过重传
+    int syn_retry_count;    // 本端握手报文已经重传的次数
+    uint32_t rto_ms;        // 当前连接使用的重传超时，单位ms
+
+    // 连接关闭状态
+    uint32_t fin_seq;       // 本端FIN使用的序号
+    int fin_sent;           // 本端是否已经发送FIN
+    int fin_acked;          // 本端FIN是否已经得到确认
+    int fin_retry_count;    // FIN已经重传的次数
+    uint32_t fin_rto_ms;    // FIN独立重传计时器，避免与数据RTO相互覆盖
+    int peer_fin_received;  // 是否已经收到并确认对端FIN
+    int close_requested;    // 调用close后禁止继续提交发送数据
+    int close_failed;       // 关闭是否因超过重试上限失败
     
     // 连接状态变化的同步
     pthread_mutex_t state_lock;
@@ -124,10 +164,38 @@ typedef struct  tju_tcp{
 	pthread_mutex_t send_lock; // 发送数据锁
 	char* sending_buf; // 发送数据缓存区
 	int sending_len; // 发送数据缓存长度
+	int sending_head;
+	pthread_cond_t send_cond;
+	pthread_cond_t send_space_cond;
+	pthread_cond_t send_drained_cond;
+	uint16_t peer_rwnd;
+	uint16_t last_peer_rwnd;
+	uint32_t last_ack_seen;
+	int duplicate_ack_count;
+	int fast_retransmit_pending;
+	int fast_recovery;
+	uint32_t recovery_seq;
+	int data_worker_stop;
+	int data_worker_started;
+	sent_segment_t* inflight_head;
+	sent_segment_t* inflight_tail;
+	int rtt_initialized;
+	double srtt_ms;
+	double rttvar_ms;
+	uint64_t data_timer_started_us;
+	int loss_probe_sent;
+	uint64_t zero_probe_due_us;
+	uint32_t zero_probe_rto_ms;
 
 	pthread_mutex_t recv_lock; // 接收数据锁
 	char* received_buf; // 接收数据缓存区
 	int received_len; // 接收数据缓存长度
+	int received_head;
+	char* recv_window_data;
+	uint8_t* recv_window_mark;
+	int recv_window_head;
+	int recv_window_marked;
+	uint16_t last_advertised_window;
 
 	pthread_cond_t wait_cond; // 可以被用来唤醒recv函数调用时等待的线程
 
@@ -136,4 +204,3 @@ typedef struct  tju_tcp{
 } tju_tcp_t;
 
 #endif
-
